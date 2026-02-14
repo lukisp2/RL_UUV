@@ -229,12 +229,8 @@ def baseline_action_from_obs_raw(
     speed_F = float(x[7] * vel_scale)
     heading_F = _heading_from_cos_sin(x[8], x[9])
 
-
     leader_speed = float(x[11] * max(cfg.leader_speed_max, 1e-6))
     heading_L = _heading_from_cos_sin(x[12], x[13])
-
-
-
 
     vL = vel_vec2(leader_speed, heading_L)
 
