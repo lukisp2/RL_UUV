@@ -51,6 +51,9 @@ import datetime as _dt
 import json
 import math
 import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1663,6 +1666,14 @@ class UUVRelPosBankEnv(gym.Env):
         pygame.display.flip()
         self._clock.tick(self.cfg.render_fps)
 
+    def save_render_frame(self, path: str) -> bool:
+        if self.render_mode != "human" or pygame is None:
+            return False
+        if not self._pygame_inited or self._screen is None:
+            return False
+        pygame.image.save(self._screen, path)
+        return True
+
     def close(self):
         if self._pygame_inited and pygame is not None:
             pygame.quit()
@@ -1738,10 +1749,105 @@ def _vec_unnormalize_obs(vecnorm, obs_norm: np.ndarray) -> np.ndarray:
         return obs_norm
 
 
+def _reset_eval_env(venv, episode_seed: int):
+    try:
+        if hasattr(venv, "seed"):
+            venv.seed(int(episode_seed))
+    except Exception:
+        pass
+    try:
+        return venv.reset()
+    except TypeError:
+        return venv.reset(seed=int(episode_seed))
+
+
+def _get_base_env(venv):
+    try:
+        if hasattr(venv, "envs") and len(getattr(venv, "envs")) > 0:
+            return venv.envs[0]
+    except Exception:
+        pass
+    try:
+        if hasattr(venv, "venv"):
+            return _get_base_env(venv.venv)
+    except Exception:
+        pass
+    return None
+
+
+def _encode_mp4_from_frames(frames_dir: str, fps: int, out_path: str) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found in PATH.")
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-framerate",
+        str(int(max(1, fps))),
+        "-i",
+        os.path.join(frames_dir, "frame_%06d.png"),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        out_path,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _concat_mp4_files(inputs: List[str], out_path: str) -> None:
+    if not inputs:
+        return
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg not found in PATH.")
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        list_path = f.name
+        for path in inputs:
+            norm = os.path.abspath(path).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{norm}'\n")
+
+    try:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_path,
+            "-c",
+            "copy",
+            out_path,
+        ]
+        subprocess.run(cmd, check=True)
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+
+
 def save_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
-    fieldnames = list(rows[0].keys())
+
+    # Some info fields, e.g. terminal_observation, may appear only on the last step.
+    # Build the header from all rows so episodic fields do not break CSV export.
+    fieldnames: List[str] = []
+    seen = set()
+    for r in rows:
+        for k in r.keys():
+            if k not in seen:
+                seen.add(k)
+                fieldnames.append(k)
+
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -1774,7 +1880,16 @@ def cmd_eval(args: argparse.Namespace) -> None:
         log_truth_diagnostics=True,  # always on for eval logs
     )
 
-    base_env = DummyVecEnv([make_env(int(args.seed), cfg, render=bool(args.render))])
+    record_mp4 = bool(getattr(args, "record_mp4", False))
+    record_keep_frames = bool(getattr(args, "record_keep_frames", False))
+    render_requested = bool(args.render or record_mp4)
+    record_fps = int(getattr(args, "record_fps", 0))
+    if record_mp4 and shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found in PATH. Install ffmpeg or disable --record-mp4.")
+    if record_fps <= 0:
+        record_fps = int(cfg.render_fps)
+
+    base_env = DummyVecEnv([make_env(int(args.seed), cfg, render=render_requested)])
 
     # VecNormalize (optional)
     vn_path = os.path.join(args.models_dir, "vecnormalize.pkl")
@@ -1823,7 +1938,10 @@ def cmd_eval(args: argparse.Namespace) -> None:
         "cfg": asdict(cfg),
         "seed": int(args.seed),
         "episodes": int(args.episodes),
-        "render": bool(args.render),
+        "render": render_requested,
+        "record_mp4": record_mp4,
+        "record_keep_frames": record_keep_frames,
+        "record_fps": int(record_fps),
         "fim_window": float(args.fim_window),
         "fim_reg_eps": float(args.fim_reg_eps),
         "fim_use_gating": bool(args.fim_use_gating),
@@ -1834,25 +1952,30 @@ def cmd_eval(args: argparse.Namespace) -> None:
     print("[EVAL] meta:", meta_path)
 
     summary_rows: List[Dict[str, Any]] = []
+    combined_render_inputs: List[str] = []
+    combined_render_mp4_path = ""
 
     # helper: render inside VecEnv
     def _render_vecenv(venv):
-        try:
-            if hasattr(venv, "envs") and len(getattr(venv, "envs")) > 0:
-                venv.envs[0].render()
-                return
-        except Exception:
-            pass
-        try:
-            if hasattr(venv, "venv") and hasattr(venv.venv, "envs") and len(getattr(venv.venv, "envs")) > 0:
-                venv.venv.envs[0].render()
-                return
-        except Exception:
-            pass
+        env0 = _get_base_env(venv)
+        if env0 is None:
+            return None
+        env0.render()
+        return env0
 
     # run episodes
     for ep in range(int(args.episodes)):
-        obs = env.reset()
+        episode_seed = int(args.seed) + ep
+        ts = _timestamp()
+        base = os.path.join(out_dir, f"eval_trace_{ts}_seed{int(args.seed)}_ep{ep+1:03d}")
+        render_frames_dir = ""
+        render_mp4_path = ""
+        render_frame_idx = 0
+        if record_mp4:
+            render_frames_dir = base + "_render_frames"
+            _ensure_dir(render_frames_dir)
+
+        obs = _reset_eval_env(env, episode_seed)
         done = False
         ep_return = 0.0
 
@@ -1894,8 +2017,12 @@ def cmd_eval(args: argparse.Namespace) -> None:
             done = bool(dones[0])
             ep_return += float(reward[0])
 
-            if args.render:
-                _render_vecenv(env)
+            if render_requested:
+                render_env = _render_vecenv(env)
+                if render_frames_dir and render_env is not None:
+                    frame_path = os.path.join(render_frames_dir, f"frame_{render_frame_idx:06d}.png")
+                    if render_env.save_render_frame(frame_path):
+                        render_frame_idx += 1
 
             info0 = infos[0] if infos else {}
             term_reason = str(info0.get("term_reason", "")) if done else term_reason
@@ -1917,6 +2044,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
             row: Dict[str, Any] = {
                 "episode": ep + 1,
+                "episode_seed": episode_seed,
                 "step": step_idx,
                 "t": float(info0.get("t", np.nan)),
                 "reward": float(reward[0]),
@@ -1960,22 +2088,31 @@ def cmd_eval(args: argparse.Namespace) -> None:
             step_idx += 1
 
         # save episode trace
-        ts = _timestamp()
-        base = os.path.join(out_dir, f"eval_trace_{ts}_seed{int(args.seed)}_ep{ep+1:03d}")
         csv_path = base + ".csv"
         npz_path = base + ".npz"
         save_csv(csv_path, rows)
         save_npz(npz_path, npz)
 
-        print(f"[EVAL] ({controller}) ep {ep+1}/{args.episodes} return={ep_return:.2f} term={term_reason} "
+        if render_frames_dir:
+            if render_frame_idx > 0:
+                render_mp4_path = base + "_render.mp4"
+                _encode_mp4_from_frames(render_frames_dir, record_fps, render_mp4_path)
+                combined_render_inputs.append(render_mp4_path)
+            if not record_keep_frames:
+                shutil.rmtree(render_frames_dir, ignore_errors=True)
+
+        print(f"[EVAL] ({controller}) ep {ep+1}/{args.episodes} seed={episode_seed} return={ep_return:.2f} term={term_reason} "
               f"t_end={t_end:.1f}s err_true_end={err_true_end:.2f} err_est_end={err_est_end:.2f} "
               f"eigmin(FIM_win)={fim_eig_min_end:.3e} crlb_trace_win={crlb_trace_end:.2f}")
         print("       csv:", csv_path)
         print("       npz:", npz_path)
+        if render_mp4_path:
+            print("       mp4:", render_mp4_path)
 
         summary_rows.append({
             "episode": ep + 1,
             "seed": int(args.seed),
+            "episode_seed": int(episode_seed),
             "return": float(ep_return),
             "term_reason": term_reason,
             "t_end": float(t_end),
@@ -1985,13 +2122,27 @@ def cmd_eval(args: argparse.Namespace) -> None:
             "crlb_win_trace_end": float(crlb_trace_end),
             "trace_csv": os.path.basename(csv_path),
             "trace_npz": os.path.basename(npz_path),
+            "render_mp4": os.path.basename(render_mp4_path) if render_mp4_path else "",
             "controller": controller,
         })
+
+    if record_mp4 and combined_render_inputs:
+        combined_render_mp4_path = os.path.join(out_dir, f"eval_render_{ts0}_seed{int(args.seed)}_all_eps.mp4")
+        _concat_mp4_files(combined_render_inputs, combined_render_mp4_path)
+        print("[EVAL] combined mp4:", combined_render_mp4_path)
 
     # save summary
     summary_path = os.path.join(out_dir, f"eval_summary_{ts0}.json")
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump({"meta": meta, "episodes": summary_rows}, f, indent=2)
+        json.dump(
+            {
+                "meta": meta,
+                "combined_render_mp4": os.path.basename(combined_render_mp4_path) if combined_render_mp4_path else "",
+                "episodes": summary_rows,
+            },
+            f,
+            indent=2,
+        )
     print("[EVAL] summary:", summary_path)
 
     env.close()
@@ -2018,6 +2169,12 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--seed", type=int, default=42)
     pe.add_argument("--action-dt", type=float, default=2.0)
     pe.add_argument("--render", action="store_true")
+    pe.add_argument("--record-mp4", action="store_true",
+                    help="Save per-episode MP4 from the exact pygame render used by --render.")
+    pe.add_argument("--record-keep-frames", action="store_true",
+                    help="Keep raw PNG frames used to build --record-mp4 videos.")
+    pe.add_argument("--record-fps", type=int, default=0,
+                    help="FPS for --record-mp4. 0 => use environment render_fps.")
     pe.add_argument("--device", choices=["cpu", "cuda", "mps", "auto"], default="auto")
 
     pe.add_argument("--out-dir", type=str, default="eval_fim_logs")

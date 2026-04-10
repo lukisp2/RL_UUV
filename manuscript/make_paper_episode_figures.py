@@ -101,8 +101,8 @@ from matplotlib.lines import Line2D
 CTRL_ORDER = ["rl", "baseline_pid", "baseline_pid_exc", "baseline_random"]
 CTRL_LABEL = {
     "rl": "RL",
-    "baseline_pid": "PID",
-    "baseline_pid_exc": "PID+exc",
+    "baseline_pid": "P",
+    "baseline_pid_exc": "P+exc",
     "baseline_random": "Random",
 }
 CTRL_COLOR = {
@@ -378,6 +378,33 @@ def _controller_legend(ax: plt.Axes, *, ncol: int = 2, loc: str = "best", fontsi
     labels = [CTRL_LABEL[c] for c in CTRL_ORDER]
     ax.legend(handles, labels, loc=loc, ncol=ncol, fontsize=fontsize, title=title)
 
+def _info_excitation_legend_items() -> Tuple[List[Line2D], List[str]]:
+    handles_style = [
+        Line2D([0], [0], color="k", lw=2, ls="-"),
+        Line2D([0], [0], color="k", lw=2, ls="--"),
+    ]
+    labels_style = [
+        r"$\lambda_{\min}(\mathbf{J}_w)$ (left)",
+        r"$\overline{v}_{\perp}$ (right)",
+    ]
+    handles_ctrl = [Line2D([0], [0], color=CTRL_COLOR[c], lw=2) for c in CTRL_ORDER]
+    labels_ctrl = [CTRL_LABEL[c] for c in CTRL_ORDER]
+    return handles_style + handles_ctrl, labels_style + labels_ctrl
+
+def _info_excitation_legends(ax: plt.Axes, *, fontsize: int = 8) -> None:
+    handles, labels = _info_excitation_legend_items()
+    ax.legend(
+        handles,
+        labels,
+        title="Line style + Controller",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.0),
+        fontsize=fontsize,
+        ncol=3,
+        columnspacing=1.2,
+        handletextpad=0.6,
+    )
+
 
 # ---------------------------
 # Panel builders (each returns a Figure)
@@ -464,24 +491,22 @@ def _panel_info_excitation(
     if title:
         ax.set_title(title)
 
-    # --- Legends: controller colors + line styles (requested) ---
-    handles_ctrl = [Line2D([0], [0], color=CTRL_COLOR[c], lw=2) for c in CTRL_ORDER]
-    labels_ctrl = [CTRL_LABEL[c] for c in CTRL_ORDER]
-    leg1 = ax.legend(handles_ctrl, labels_ctrl, title="Controller", loc="upper left", fontsize=8)
-    ax.add_artist(leg1)
-
-    handles_style = [
-        Line2D([0], [0], color="k", lw=2, ls="-"),
-        Line2D([0], [0], color="k", lw=2, ls="--"),
-    ]
-    labels_style = [
-        r"$\lambda_{\min}(\mathbf{J}_w)$ (left)",
-        r"$\overline{v}_{\perp}$ (right)",
-    ]
-    ax.legend(handles_style, labels_style, title="Line style", loc="upper right", fontsize=8)
+    handles, labels = _info_excitation_legend_items()
+    fig.legend(
+        handles,
+        labels,
+        title="Line style + Controller",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.995),
+        borderaxespad=0.0,
+        fontsize=8,
+        ncol=3,
+        columnspacing=1.3,
+        handletextpad=0.6,
+    )
 
     ax.grid(True, alpha=0.25)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
     return fig
 
 def _panel_speed(dfs: Dict[str, pd.DataFrame], *, title: Optional[str] = None) -> plt.Figure:
@@ -616,14 +641,7 @@ def build_episode_figure(
 
     ax.set_title("Information and excitation")
 
-    # Legends (controller + line style)
-    handles_ctrl = [Line2D([0], [0], color=CTRL_COLOR[c], lw=2) for c in CTRL_ORDER]
-    labels_ctrl = [CTRL_LABEL[c] for c in CTRL_ORDER]
-    leg1 = ax.legend(handles_ctrl, labels_ctrl, title="Controller", loc="upper left", fontsize=8)
-    ax.add_artist(leg1)
-    handles_style = [Line2D([0], [0], color="k", lw=2, ls="-"), Line2D([0], [0], color="k", lw=2, ls="--")]
-    labels_style = [r"$\lambda_{\min}(\mathbf{J}_w)$ (left)", r"$\overline{v}_{\perp}$ (right)"]
-    ax.legend(handles_style, labels_style, title="Line style", loc="upper right", fontsize=8)
+    _info_excitation_legends(ax, fontsize=8)
 
     if layout == "extended":
         # ---- (e) speed
